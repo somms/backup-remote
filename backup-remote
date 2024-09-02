@@ -1,0 +1,107 @@
+#!/bin/bash
+
+LOG_FILE="/var/log/backup_remote.log"
+
+# Función para manejar errores
+handle_error() {
+    log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error en el proceso de backup. Abortando."
+    exit 1
+}
+
+# Función para loguear mensajes
+log_message() {
+    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] $1" | tee -a "$LOG_FILE"
+}
+
+# Leer configuración
+CONFIG_FILE="$HOME/.backup_remote.conf"
+if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE="/etc/backup_remote.conf"
+fi
+
+if [ -f "$CONFIG_FILE" ]; then
+    log_message "Cargando configuración desde $CONFIG_FILE"
+    source "$CONFIG_FILE"
+else
+    log_message "No se encontró ningún archivo de configuración."
+    handle_error
+fi
+
+# Fecha actual para el nombre de los backups
+current_date=$(date +"%Y-%m-%d_%H%M%S")
+
+# Definir si es tiempo de realizar una nueva "copia completa"
+is_full_backup=false
+if [ $(date +%d) -eq 1 ] && [ $(expr $(date +%m) % 3) -eq 0 ]; then
+    is_full_backup=true
+    log_message "Se realizará una copia completa."
+else
+    log_message "Se realizará una copia incremental."
+fi
+
+# Hacer backup para cada ruta especificada en el archivo de configuración
+for path in "${backup_paths[@]}"; do
+    IFS=":" read -r source_dir remote_backup_subdir <<< "$path"
+    remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
+    snar_file="$remote_backup_subdir/$remote_backup_subdir.snar" # Ruta en el servidor remoto
+    local_snar_file="/tmp/$(basename "$snar_file")" # Ruta temporal en el local
+
+    log_message "Preparando copia del directorio $path a $remote_backup_subdir en el servidor $ssh_server."
+
+    # Verificar y crear el directorio remoto si no existe
+    log_message "Verificando el directorio remoto $remote_backup_dir/$remote_backup_subdir/"
+    ssh -i "$ssh_key" "$ssh_user@$ssh_server" "mkdir -p \"$remote_backup_dir/$remote_backup_subdir\"" || handle_error
+    
+    log_message "Directorio remoto verificado/creado correctamente."
+
+    if [ "$is_full_backup" = true ]; then
+        # Nueva "copia completa" (sin referencia previa)
+        log_message "Realizando nueva copia completa."
+
+        ## Eliminar el archivo .snar anterior en el servidor remoto si existe
+        #ssh -i "$ssh_key" "$ssh_user@$ssh_server" "rm -f \"$remote_backup_dir/$snar_file\"" || handle_error
+
+        # Nombre del archivo de backup
+        backup_file="${remote_backup_subdir}-${current_date}.tar.gz"
+
+        # Eliminar el archivo .snar local si existe
+        rm -f "$local_snar_file"
+    else
+        # Backup incremental
+        log_message "Realizando copia incremental."
+        log_message "Comprobando existencia de snapshot previo en el servidor remoto para $source_dir"
+        if ssh -i "$ssh_key" "$ssh_user@$ssh_server" test -e "$remote_backup_dir/$snar_file"; then
+            log_message "Descargando snapshot previo para $source_dir."
+            scp -i "$ssh_key" "$ssh_user@$ssh_server:$remote_backup_dir/$snar_file" "$local_snar_file" || handle_error
+        fi
+                
+        # Nombre del archivo de backup incremental
+        backup_file="${remote_backup_subdir}-${current_date}.tar.gz"
+    fi
+
+    log_message "Creando backup"
+    # Crear el backup y manejar el archivo .snar en el servidor remoto
+    tar --create --gzip --file=- --listed-incremental="$local_snar_file" "$source_dir" | ssh -i "$ssh_key" "$ssh_user@$ssh_server" "cat > \"$remote_backup_dir/$remote_backup_subdir/$backup_file\""
+
+    log_message "Actualizando fichero de seguimiento .snar"
+    # Subir el archivo .snar actualizado al servidor remoto
+    scp -i "$ssh_key" "$local_snar_file" "$ssh_user@$ssh_server:$remote_backup_dir/$remote_backup_subdir/" || handle_error
+
+    # Comprobar si el backup se realizó correctamente
+    if [ $? -eq 0 ]; then
+        log_message "Backup realizado con éxito: $backup_file"
+        
+        if [ "$is_full_backup" = true ]; then
+            # Eliminar copias anteriores del directorio remoto
+            log_message "Eliminando copias completas e incrementales anteriores."
+            ssh -i "$ssh_key" "$ssh_user@$ssh_server" "
+                find \"$remote_backup_dir/$remote_backup_subdir/\" -type f -name '*.tar.gz' ! -name '$backup_file' -delete
+            " || handle_error
+        fi
+    else
+        log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error al realizar el backup."
+        handle_error
+    fi
+done
+
+log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Todos los backups se han realizado con éxito."
