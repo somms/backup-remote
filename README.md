@@ -44,8 +44,13 @@ El script utiliza un archivo de configuración para definir las rutas de backup 
 # ~/.backup_remote.conf o /etc/backup_remote.conf
 
 # Usuario y host remoto
-remote_user="usuario"
-remote_host="servidor.remoto.com"
+ssh_user="usuario"
+ssh_host="servidor.remoto.com"
+ssh_key="~/.ssh/id_rsa" 
+
+# Carpeta raíz de destino en el servidor de backups
+remote_backup_dir="/var/backups/sourcename"
+
 
 # Lista de rutas de backup en formato "directorio_local:directorio_remoto"
 backup_paths=(
@@ -77,20 +82,15 @@ backup_paths=(
 1. **Listar las Fechas Disponibles**:
    - Ejecuta el siguiente comando para listar todas las fechas de backup disponibles para un directorio específico:
      ```bash
-     ./backup-restore --list /ruta/al/directorio
+     ./backup-restore --list-dates /ruta/local
      ```
 
 2. **Restaurar un Backup Específico**:
    - Para restaurar un backup específico, usa el siguiente comando:
      ```bash
-     ./backup-restore --restore /ruta/al/directorio YYYY-MM-DD_HHMMSS
+     ./backup-restore YYYY-MM-DD_HHMMSS /ruta/local_original /ruta/local_destino 
      ```
 
-3. **Restaurar el Último Backup**:
-   - Para restaurar la copia de seguridad más reciente disponible, ejecuta:
-     ```bash
-     ./backup-restore --restore-latest /ruta/al/directorio
-     ```
 
 ## Requisitos
 
