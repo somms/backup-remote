@@ -53,6 +53,9 @@ for path in "${backup_paths[@]}"; do
     ssh -i "$ssh_key" "$ssh_user@$ssh_server" "mkdir -p \"$remote_backup_dir/$remote_backup_subdir\"" || handle_error
     
     log_message "Directorio remoto verificado/creado correctamente."
+	
+	# Eliminamos el archivoi .snar anterior en local si existiera de una operación anterior
+	rm $local_snar_file
 
     if [ "$is_full_backup" = true ]; then
         # Nueva "copia completa" (sin referencia previa)
@@ -90,7 +93,6 @@ for path in "${backup_paths[@]}"; do
     # Comprobar si el backup se realizó correctamente
     if [ $? -eq 0 ]; then
         log_message "Backup realizado con éxito: $backup_file"
-        
         if [ "$is_full_backup" = true ]; then
             # Eliminar copias anteriores del directorio remoto
             log_message "Eliminando copias completas e incrementales anteriores."
@@ -102,6 +104,9 @@ for path in "${backup_paths[@]}"; do
         log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error al realizar el backup."
         handle_error
     fi
+	
+	#Borrando ficheros temporales
+
 done
 
 log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Todos los backups se han realizado con éxito."
