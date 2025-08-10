@@ -2,23 +2,24 @@
 
 LOG_FILE="/var/log/backup_remote.log"
 
-# Función para manejar errores
+# Función para manejar errores y terminar la ejecución con mensaje
 handle_error() {
     log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error en el proceso de backup. Abortando."
     exit 1
 }
 
-# Función para loguear mensajes
+# Función para loguear mensajes con fecha y hora, y mostrar en pantalla y archivo de log
 log_message() {
     echo "[$(date +%Y-%m-%d\ %H:%M:%S)] $1" | tee -a "$LOG_FILE"
 }
 
-# Leer configuración
+# Ruta al archivo de configuración: primero intenta en $HOME, si no existe usa /etc
 CONFIG_FILE="$HOME/.backup_remote.conf"
 if [ ! -f "$CONFIG_FILE" ]; then
     CONFIG_FILE="/etc/backup_remote.conf"
 fi
 
+# Si el archivo de configuración existe, lo carga y loguea la acción; sino termina con error
 if [ -f "$CONFIG_FILE" ]; then
     log_message "Cargando configuración desde $CONFIG_FILE"
     source "$CONFIG_FILE"
@@ -27,17 +28,16 @@ else
     handle_error
 fi
 
-# Función para listar las fechas disponibles
+# Función para listar las fechas disponibles de backups para un directorio origen dado
 list_dates() {
     source_dir="$1"
+    # Vuelve a cargar la configuración para asegurar variables definidas
+    source "$CONFIG_FILE"
 
-    # Leer configuración
-    source backup_remote.conf
-
-    # Buscar la subcarpeta correspondiente al directorio de origen
+    # Buscar la subcarpeta de backup asociada al directorio de origen
     for path in "${backup_paths[@]}"; do
         IFS=":" read -r config_source_dir remote_backup_subdir <<< "$path"
-        remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
+        remote_backup_subdir="${remote_backup_subdir%/}"  # elimina barra al final si existe
 
         if [ "$config_source_dir" == "$source_dir" ]; then
             break
@@ -49,10 +49,10 @@ list_dates() {
         exit 1
     fi
 
-    # Obtener la lista de archivos de backup en orden cronológico
+    # Lista los archivos tar.gz ordenados cronológicamente desde el servidor remoto
     backup_files=$(ssh -i "$ssh_key" "$ssh_user@$ssh_server" "ls -1 $remote_backup_dir/$remote_backup_subdir/*.tar.gz" | sort)
 
-    # Extraer y mostrar las fechas disponibles
+    # Extrae y muestra las fechas disponibles (parseando el nombre de archivo)
     echo "Fechas disponibles para restaurar en $source_dir:"
     for file in $backup_files; do
         backup_filename=$(basename "$file" .tar.gz)
@@ -61,7 +61,7 @@ list_dates() {
     done
 }
 
-# Verificar que se ha pasado al menos un argumento
+# Validación básica: si no hay argumento se muestra el uso y se termina
 if [ -z "$1" ]; then
     echo "Uso: $0 <fecha-a-restaurar> <directorio-origen> <directorio-destino>"
     echo "       o"
@@ -70,7 +70,7 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
-# Opción para listar las fechas disponibles
+# Si el argumento es listar fechas, llama a la función y termina
 if [ "$1" == "--list-dates" ]; then
     if [ -z "$2" ]; then
         echo "Debe especificar el directorio de origen para listar las fechas disponibles."
@@ -80,21 +80,22 @@ if [ "$1" == "--list-dates" ]; then
     exit 0
 fi
 
+# Variables principales para restauración: fecha, directorio origen y destino
 restore_date="$1"
 source_dir="$2"
 target_dir="$3"
 
-# Leer configuración
-source backup_remote.conf
+# Recarga configuración para asegurarse variables definidas
+source "$CONFIG_FILE"
 
-# Buscar la subcarpeta correspondiente al directorio de origen
+# Busca la subcarpeta remota y define paths para archivo .snar
 for path in "${backup_paths[@]}"; do
     IFS=":" read -r config_source_dir remote_backup_subdir <<< "$path"
-    remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
+    remote_backup_subdir="${remote_backup_subdir%/}"
 
     if [ "$config_source_dir" == "$source_dir" ]; then
-        snar_file="$remote_backup_subdir/$remote_backup_subdir.snar" # Ruta en el servidor remoto
-        local_snar_file="/tmp/$(basename "$snar_file")" # Ruta temporal en el local
+        snar_file="$remote_backup_subdir/$remote_backup_subdir.snar"
+        local_snar_file="/tmp/$(basename "$snar_file")"
         break
     fi
 done
@@ -104,25 +105,22 @@ if [ -z "$remote_backup_subdir" ]; then
     exit 1
 fi
 
-# Crear el directorio temporal donde se restaurarán los archivos
+# Define el directorio temporal para restaurar; si no se pasa destino, crea uno random en /tmp
 if [ -z "$3" ]; then
     temp_restore_dir="/tmp/restore_$remote_backup_subdir$RANDOM"
-
 else
     temp_restore_dir="$3"
 fi
 
-mkdir -p "$temp_restore_dir"
+mkdir -p "$temp_restore_dir" # crea el directorio si no existe
 
-# Obtener la lista de archivos de backup en orden cronológico
+# Obtiene lista completa de backups remotos ordenados cronológicamente
 backup_files=$(ssh -i "$ssh_key" "$ssh_user@$ssh_server" "ls -1 $remote_backup_dir/$remote_backup_subdir/*.tar.gz" | sort)
 
-# Filtrar los backups hasta la fecha de restauración
+# Filtra solo los backups con fecha hasta la solicitada para restaurar (inclusive)
 files_to_restore=()
 for file in $backup_files; do
     backup_filename=$(basename "$file" .tar.gz)
-
-    # Obtener la fecha del backup a partir del nombre del archivo
     backup_date=$(echo "$backup_filename" | grep -oP '(\d{4}-\d{2}-\d{2}_\d{6})')
 
     if [ "$backup_date" \< "$restore_date" ] || [ "$backup_date" == "$restore_date" ]; then
@@ -130,26 +128,32 @@ for file in $backup_files; do
     fi
 done
 
-# Verificar que hay archivos para restaurar
+# Si no hay backups para restaurar, termina con mensaje
 if [ ${#files_to_restore[@]} -eq 0 ]; then
     echo "No se encontraron backups para restaurar hasta la fecha $restore_date"
     exit 1
 fi
 
-# Restaurar los archivos en orden cronológico
-for file in "${files_to_restore[@]}"; do
-    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restaurando desde $file"
-    
-    # Descargar el archivo de backup y restaurar desde él
-    ssh -i "$ssh_key" "$ssh_user@$ssh_server" "cat $file" | tar --extract --gzip --listed-incremental=/dev/null --directory="$temp_restore_dir"
+total_files=${#files_to_restore[@]}
 
+# Bucle para restaurar cada archivo en orden cronológico mostrando progreso
+for i in "${!files_to_restore[@]}"; do
+    file="${files_to_restore[$i]}"
+    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restaurando archivo $((i+1)) de $total_files: $file"
+
+    # Se descarga el archivo remoto, se pasa por pv para mostrar barra de progreso,
+    # y se extrae con tar usando --checkpoint para mostrar puntos cada 1000 registros
+    ssh -i "$ssh_key" "$ssh_user@$ssh_server" "cat $file" | pv | tar --extract --gzip --listed-incremental=/dev/null --directory="$temp_restore_dir" --checkpoint=1000 --checkpoint-action=dot
+    echo ""  # salto de línea tras los puntos del checkpoint
+
+    # Control de errores en la restauración
     if [ $? -ne 0 ]; then
         echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Error al restaurar desde $file"
         handle_error
     fi
 done
 
-# Restaurar el archivo .snar
+# Restaura el archivo .snar incremental, si está definido
 if [ -n "$local_snar_file" ]; then
     echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restaurando el archivo .snar desde el servidor remoto"
     scp -i "$ssh_key" "$ssh_user@$ssh_server:$remote_backup_dir/$remote_backup_subdir/$(basename "$snar_file")" "$local_snar_file" || handle_error
