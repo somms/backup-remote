@@ -5,7 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK=$(mktemp -d /tmp/backup-remote-test.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+CHECKPOINT_FILE="/tmp/restore_checkpoint_testdata.txt"
+trap 'rm -rf "$WORK"; rm -f "$CHECKPOINT_FILE"' EXIT
 
 HOME_DIR="$WORK/home"
 SRC="$WORK/src"
@@ -93,6 +94,12 @@ fi
 if [[ "$cmd" == cat\ \>* && -n "${BACKUP_TEST_FAIL_CAT:-}" ]]; then
     cat >/dev/null || true
     exit 1
+fi
+# Fallo inyectado al leer un archivo remoto concreto (restauración a mitad de cadena).
+if [[ -n "${BACKUP_TEST_FAIL_RESTORE_MATCH:-}" && "$cmd" == cat\ /* ]]; then
+    if [[ "$cmd" == *"$BACKUP_TEST_FAIL_RESTORE_MATCH"* ]]; then
+        exit 1
+    fi
 fi
 bash -c "$cmd"
 EOF
@@ -231,6 +238,74 @@ else
 fi
 expect_file "3. restore incluye added.txt" "${added_path:-/no/added.txt}"
 expect_no_file "3. restore no incluye node_modules" "${secret_path:-/__not_found__}"
+
+# --- 3b. --resume, checkpoint y mensajes de tamaño ---
+rm -f "$CHECKPOINT_FILE"
+expect_no_file "3b. checkpoint ausente tras restore completo" "$CHECKPOINT_FILE"
+if grep -q 'tamaño:' "$BACKUP_REMOTE_LOG"; then
+    assert_ok "3b. el log de restore incluye tamaño"
+else
+    assert_fail "3b. el log de restore incluye tamaño"
+fi
+
+RESTORE_RESUME="$WORK/restore-resume"
+rm -rf "$RESTORE_RESUME"
+mkdir -p "$RESTORE_RESUME"
+set +e
+BACKUP_TEST_FAIL_RESTORE_MATCH="-inc.tar.gz" \
+    run_restore --restore "$SRC" "$inc1_date" "$RESTORE_RESUME" >/dev/null 2>&1
+rc=$?
+set -e
+expect_rc "3b. fallo a mitad de cadena aborta" "$rc" "1"
+full1_base=$(basename -- "$full1" .tar.gz)
+expect_file "3b. checkpoint tras aplicar el full" "$CHECKPOINT_FILE"
+expect_eq "3b. checkpoint apunta al full" "$(cat "$CHECKPOINT_FILE")" "$full1_base"
+hello_path=$(find_restored hello.txt "$RESTORE_RESUME")
+if [[ -f "$hello_path" ]] && grep -q 'hello-v1' "$hello_path"; then
+    assert_ok "3b. tras fallo parcial queda el contenido del full"
+else
+    assert_fail "3b. tras fallo parcial queda el contenido del full" "path=$hello_path"
+fi
+
+log_mark=$(wc -l <"$BACKUP_REMOTE_LOG")
+run_restore --resume --restore "$SRC" "$inc1_date" "$RESTORE_RESUME"
+resume_log=$(tail -n +"$((log_mark + 1))" "$BACKUP_REMOTE_LOG")
+if echo "$resume_log" | grep -q 'Modo reanudar activado'; then
+    assert_ok "3b. --resume anuncia modo reanudar"
+else
+    assert_fail "3b. --resume anuncia modo reanudar" "$resume_log"
+fi
+if echo "$resume_log" | grep -q "Saltando ${full1_base}"; then
+    assert_ok "3b. --resume salta el full ya aplicado"
+else
+    assert_fail "3b. --resume salta el full ya aplicado" "$resume_log"
+fi
+hello_path=$(find_restored hello.txt "$RESTORE_RESUME")
+added_path=$(find_restored added.txt "$RESTORE_RESUME")
+if [[ -f "$hello_path" ]] && grep -q 'hello-v2' "$hello_path"; then
+    assert_ok "3b. --resume deja hello-v2"
+else
+    assert_fail "3b. --resume deja hello-v2" "path=$hello_path"
+fi
+expect_file "3b. --resume aplica added.txt del inc" "${added_path:-/no/added.txt}"
+expect_no_file "3b. checkpoint borrado al completar --resume" "$CHECKPOINT_FILE"
+
+rm -rf "$RESTORE_RESUME"
+mkdir -p "$RESTORE_RESUME"
+log_mark=$(wc -l <"$BACKUP_REMOTE_LOG")
+run_restore --resume "$inc1_date" "$SRC" "$RESTORE_RESUME"
+resume_log=$(tail -n +"$((log_mark + 1))" "$BACKUP_REMOTE_LOG")
+if echo "$resume_log" | grep -q 'No existe checkpoint previo'; then
+    assert_ok "3b. --resume sin checkpoint avisa y empieza de cero"
+else
+    assert_fail "3b. --resume sin checkpoint avisa y empieza de cero" "$resume_log"
+fi
+hello_path=$(find_restored hello.txt "$RESTORE_RESUME")
+if [[ -f "$hello_path" ]] && grep -q 'hello-v2' "$hello_path"; then
+    assert_ok "3b. forma posicional --resume restaura bien"
+else
+    assert_fail "3b. forma posicional --resume restaura bien" "path=$hello_path"
+fi
 
 # --- 4. Restore a fecha del full: sin added.txt ---
 rm -rf "$RESTORE"
