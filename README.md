@@ -1,115 +1,81 @@
-
 # Backup Remote Script
 
-Este conjunto de scripts, `backup-remote` y `backup-restore`, proporciona una solución completa para realizar y restaurar copias de seguridad de directorios locales a un servidor remoto utilizando `ssh` y `tar`. Dependiendo de la fecha, el script decide si realiza una copia de seguridad completa o incremental, realizando una nueva copia completa como máximo cada tres meses. Además, registra todas las actividades y errores en un archivo de log ubicado en `/var/log/backup_remote.log`.
+Scripts `backup-remote` y `backup-restore` para copiar directorios locales a un servidor por SSH con GNU `tar --listed-incremental`. El archivo se genera en un pipe hacia el remoto: no hace falta espacio local del tamaño del backup.
 
-## Funcionalidades
+Cada ciclo empieza con un **full** (`*-full.tar.gz`) y sigue con **incrementales** (`*-inc.tar.gz`). Un full nuevo se hace si no hay `.snar` remoto, si no hay ningún `-full.tar.gz`, o si el último full tiene más de `full_backup_max_days` días (90 por defecto). Forzar: `BACKUP_FORCE_FULL=1`.
 
-### `backup-remote`
-1. **Configuración Automática**: 
-   - El script primero busca la configuración en `~/.backup_remote.conf`.
-   - Si no encuentra este archivo, intenta cargar la configuración desde `/etc/backup_remote.conf`.
+Tras un full verificado se conservan `keep_full_cycles` ciclos (2 por defecto): el full nuevo, el anterior y los incrementales desde ese full anterior. No se borra el ciclo previo hasta que el full nuevo pasa `gzip -t` en el servidor.
 
-2. **Copia de Seguridad**:
-   - **Copia Completa**: Realiza una copia completa si es el primer día de un trimestre (enero, abril, julio, octubre). No utiliza el archivo `.snar` existente, y después de un backup exitoso, elimina todas las copias anteriores y sube un nuevo archivo `.snar`.
-   - **Copia Incremental**: En cualquier otra fecha, realiza una copia incremental usando el archivo `.snar` existente para registrar solo los cambios desde la última copia.
+El log va a `/var/log/backup_remote.log` si es escribible; si no, a `~/.backup_remote.log`.
 
-3. **Registro en Log**:
-   - Todas las actividades, errores y éxitos se registran en `/var/log/backup_remote.log`.
+## Configuración
 
-### `backup-restore`
-1. **Restauración de Backups**:
-   - **Listar Fechas Disponibles**: El script `backup-restore` puede listar las fechas de las copias de seguridad disponibles para restaurar.
-   - **Restaurar un Backup**: Permite restaurar una copia de seguridad específica desde el servidor remoto al directorio local. Puedes especificar la fecha del backup que deseas restaurar.
+El script busca, en este orden:
 
-2. **Modo de Uso**:
-   - **Listar fechas de backups disponibles**:
-     ```bash
-     ./backup-restore --list <directorio_local>
-     ```
-   - **Restaurar un backup específico**:
-     ```bash
-     ./backup-restore --restore <directorio_local> <fecha>
-     ```
-   - **Restaurar el último backup disponible**:
-     ```bash
-     ./backup-restore --restore-latest <directorio_local>
-     ```
-
-## Archivos de Configuración
-
-El script utiliza un archivo de configuración para definir las rutas de backup y las credenciales del servidor remoto. El archivo debe estar en el formato:
+1. `~/.backup_remote.conf`
+2. `/etc/backup_remote.conf`
 
 ```bash
-# ~/.backup_remote.conf o /etc/backup_remote.conf
-
-# Usuario y host remoto
-ssh_user="usuario"
-ssh_host="servidor.remoto.com"
-ssh_key="~/.ssh/id_rsa" 
-
-# Carpeta raíz de destino en el servidor de backups
-remote_backup_dir="/var/backups/sourcename"
-
-
-# Lista de rutas de backup en formato "directorio_local:directorio_remoto"
 backup_paths=(
-    "/ruta/local1:/ruta_remota1"
-    "/ruta/local2:/ruta_remota2"
+    "/ruta/local1:nombre_remoto1"
+    "/ruta/local2:nombre_remoto2"
 )
+
+remote_backup_dir="/var/backups/sourcename"
+ssh_server="servidor.remoto.com"
+ssh_user="usuario"
+ssh_key="$HOME/.ssh/id_rsa"
+
+# Opcional
+# full_backup_max_days=90
+# keep_full_cycles=2
+# one_file_system=true
+# backup_excludes=("*/node_modules" "*/.cache" "*/.npm" "*/.local/share/Trash")
+# backup_excludes=()   # desactiva las exclusiones por defecto
 ```
+
+Si `backup_excludes` no está definido, se aplican las exclusiones por defecto de arriba. `~/.ssh` **no** se excluye: sigue yendo al USB en claro.
 
 ## Uso
 
-### `backup-remote`
-1. **Ejecutar el Script**:
-   - El script puede ser ejecutado directamente desde la terminal:
-     ```bash
-     ./backup-remote
-     ```
-   - Asegúrate de tener permisos de ejecución:
-     ```bash
-     chmod +x backup-remote
-     ```
+### backup-remote
 
-2. **Configurar el Cron Job**:
-   - Puedes programar este script para que se ejecute automáticamente usando cron. Por ejemplo, para ejecutarlo todos los días a la medianoche:
-     ```bash
-     0 0 * * * /ruta/al/script/backup-remote
-     ```
+```bash
+./backup-remote
+BACKUP_FORCE_FULL=1 ./backup-remote
+```
 
-### `backup-restore`
-1. **Listar las Fechas Disponibles**:
-   - Ejecuta el siguiente comando para listar todas las fechas de backup disponibles para un directorio específico:
-     ```bash
-     ./backup-restore --list-dates /ruta/local
-     ```
+SSH usa `BatchMode`, keepalives (`ServerAliveInterval=30`), `ConnectTimeout` y un lock en `~/.backup-remote.lock`. En WSL intenta inhibir la suspensión de Windows vía `powershell.exe` mientras corre.
 
-2. **Restaurar un Backup Específico**:
-   - Para restaurar un backup específico, usa el siguiente comando:
-     ```bash
-     ./backup-restore YYYY-MM-DD_HHMMSS /ruta/local_original /ruta/local_destino 
-     ```
+El pipe `tar | ssh` comprueba tar y ssh por separado. tar 1 (ficheros que cambian durante la lectura) se registra como aviso; tar ≥ 2 o fallo de ssh abortan, borran el `.tar.gz` incompleto y **no** actualizan el `.snar`.
 
+`gzip -t` corre en el servidor. Si el archivo está corrupto (rc 1) se borra. Si cae SSH (suspensión, reset), el tar.gz **se deja** y no se toca el `.snar`; hay que verificar a mano en caudatus.
+
+### backup-restore
+
+GNU tar incremental exige el full que abre la cadena y los incrementales siguientes, en orden. El restore elige el `-full.tar.gz` más reciente anterior o igual a la fecha pedida.
+
+```bash
+./backup-restore --list /ruta/local
+./backup-restore --restore /ruta/local YYYY-MM-DD_HHMMSS [/ruta/destino]
+./backup-restore --restore-latest /ruta/local [/ruta/destino]
+./backup-restore YYYY-MM-DD_HHMMSS /ruta/local [/ruta/destino]
+```
+
+Sin destino, escribe en `/tmp/restore_<nombre>_<pid>`.
 
 ## Requisitos
 
-- `ssh` debe estar configurado entre el servidor local y remoto para que funcione sin necesidad de ingresar una contraseña cada vez.
-- `tar` debe estar instalado en ambos sistemas.
+- `ssh` sin contraseña interactiva (clave)
+- GNU `tar` y `gzip` en local; `gzip` en el remoto para `gzip -t`
+- `flock` (util-linux)
 
-## Logs
+## Errores comunes
 
-Los logs se generan en `/var/log/backup_remote.log`. Puedes revisar este archivo para ver el estado de las copias de seguridad y cualquier error que haya ocurrido.
-
-## Errores Comunes
-
-- **Permisos**: Asegúrate de que el usuario que ejecuta el script tenga permisos para escribir en `/var/log` y acceder a las rutas de backup tanto local como remotamente.
-- **Conexión SSH**: Verifica que la conexión SSH esté configurada correctamente y que no requiera contraseñas interactivas.
-
-## Contribuciones
-
-Si tienes sugerencias o mejoras para este script, siéntete libre de hacer un fork del proyecto y enviar un pull request.
+- **Permisos del log**: si no puedes escribir `/var/log`, el log cae en el home; no hace falta sudo solo por el log.
+- **SSH**: `BatchMode=yes` falla al instante si pide contraseña o hay host key desconocida (salvo `accept-new` en el primer contacto).
+- **Exclusiones**: un `node_modules` que quieras conservar hay que quitarlo de `backup_excludes`.
 
 ## Licencia
 
-Este proyecto está bajo la licencia GNU Affero General Public License v3.0. Para más detalles, revisa el archivo LICENSE.
+GNU Affero General Public License v3.0. Ver `LICENSE`.

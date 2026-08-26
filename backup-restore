@@ -1,158 +1,177 @@
 #!/bin/bash
+set -euo pipefail
 
-LOG_FILE="/var/log/backup_remote.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=backup-lib.sh
+source "${SCRIPT_DIR}/backup-lib.sh"
 
-# Función para manejar errores
-handle_error() {
-    log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error en el proceso de backup. Abortando."
+usage() {
+    cat <<EOF
+Uso:
+  $0 --list|--list-dates <directorio-origen>
+  $0 --restore <directorio-origen> <fecha> [directorio-destino]
+  $0 --restore-latest <directorio-origen> [directorio-destino]
+  $0 <fecha> <directorio-origen> [directorio-destino]
+
+Fecha: YYYY-MM-DD_HHMMSS
+Si no se indica destino, se restaura en /tmp/restore_<subdir>_<pid>
+EOF
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+    usage
+    exit 0
+fi
+if [[ ${1:-} == "" ]]; then
+    usage
     exit 1
-}
-
-# Función para loguear mensajes
-log_message() {
-    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] $1" | tee -a "$LOG_FILE"
-}
-
-# Leer configuración
-CONFIG_FILE="$HOME/.backup_remote.conf"
-if [ ! -f "$CONFIG_FILE" ]; then
-    CONFIG_FILE="/etc/backup_remote.conf"
 fi
 
-if [ -f "$CONFIG_FILE" ]; then
-    log_message "Cargando configuración desde $CONFIG_FILE"
-    source "$CONFIG_FILE"
-else
-    log_message "No se encontró ningún archivo de configuración."
-    handle_error
-fi
+init_log
+load_backup_config
 
-# Función para listar las fechas disponibles
-list_dates() {
-    source_dir="$1"
+list_remote_basenames() {
+    local dest_dir=$1
+    list_remote_archives "$dest_dir"
+}
 
-    # Leer configuración
-    source backup_remote.conf
+# Rellena files_to_restore con rutas remotas completas, en orden de aplicación.
+select_restore_chain() {
+    local dest_dir=$1
+    local restore_date=$2
+    local -a candidates=()
+    local -a dated=()
+    local f start_full="" start_date=""
 
-    # Buscar la subcarpeta correspondiente al directorio de origen
-    for path in "${backup_paths[@]}"; do
-        IFS=":" read -r config_source_dir remote_backup_subdir <<< "$path"
-        remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
+    files_to_restore=()
+    mapfile -t candidates < <(list_remote_basenames "$dest_dir")
 
-        if [ "$config_source_dir" == "$source_dir" ]; then
-            break
+    for f in "${candidates[@]}"; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ -z "$parsed_date" ]]; then
+            continue
+        fi
+        if [[ "$parsed_date" < "$restore_date" || "$parsed_date" == "$restore_date" ]]; then
+            dated+=("$f")
+            if [[ "$parsed_kind" == "full" ]]; then
+                start_full="$f"
+                start_date="$parsed_date"
+            fi
         fi
     done
 
-    if [ -z "$remote_backup_subdir" ]; then
-        echo "No se encontró una configuración de backup para $source_dir"
-        exit 1
+    if [[ ${#dated[@]} -eq 0 ]]; then
+        return 1
     fi
 
-    # Obtener la lista de archivos de backup en orden cronológico
-    backup_files=$(ssh -i "$ssh_key" "$ssh_user@$ssh_server" "ls -1 $remote_backup_dir/$remote_backup_subdir/*.tar.gz" | sort)
-
-    # Extraer y mostrar las fechas disponibles
-    echo "Fechas disponibles para restaurar en $source_dir:"
-    for file in $backup_files; do
-        backup_filename=$(basename "$file" .tar.gz)
-        backup_date=$(echo "$backup_filename" | grep -oP '(\d{4}-\d{2}-\d{2}_\d{6})')
-        echo "$backup_date"
-    done
+    if [[ -n "$start_date" ]]; then
+        log_message "Cadena GNU tar desde el full $start_full"
+        for f in "${dated[@]}"; do
+            parse_backup_name "$f"
+            if [[ "$parsed_date" > "$start_date" || "$parsed_date" == "$start_date" ]]; then
+                files_to_restore+=("${dest_dir}/${f}")
+            fi
+        done
+    else
+        log_message "Aviso: no hay archivo -full.tar.gz anterior a $restore_date; se aplican todos los tars hasta esa fecha (archivos antiguos)"
+        for f in "${dated[@]}"; do
+            files_to_restore+=("${dest_dir}/${f}")
+        done
+    fi
 }
 
-# Verificar que se ha pasado al menos un argumento
-if [ -z "$1" ]; then
-    echo "Uso: $0 <fecha-a-restaurar> <directorio-origen> <directorio-destino>"
-    echo "       o"
-    echo "     $0 --list-dates <directorio-origen>"
-    echo "Formato de la fecha: YYYY-MM-DD_HHMMSS"
-    exit 1
-fi
-
-# Opción para listar las fechas disponibles
-if [ "$1" == "--list-dates" ]; then
-    if [ -z "$2" ]; then
-        echo "Debe especificar el directorio de origen para listar las fechas disponibles."
-        exit 1
+list_dates() {
+    local source_dir=$1
+    local dest_dir f
+    if ! resolve_remote_subdir "$source_dir"; then
+        handle_error "no hay backup configurado para $source_dir"
     fi
-    list_dates "$2"
-    exit 0
-fi
+    dest_dir="${remote_backup_dir}/${remote_backup_subdir}"
+    echo "Fechas disponibles para restaurar ${source_dir}:"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ -n "$parsed_date" ]]; then
+            printf '%s  %s\n' "$parsed_date" "$parsed_kind"
+        fi
+    done < <(list_remote_basenames "$dest_dir")
+}
 
-restore_date="$1"
-source_dir="$2"
-target_dir="$3"
+latest_backup_date() {
+    local dest_dir=$1
+    local f latest=""
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ -n "$parsed_date" ]]; then
+            latest="$parsed_date"
+        fi
+    done < <(list_remote_basenames "$dest_dir")
+    printf '%s' "$latest"
+}
 
-# Leer configuración
-source backup_remote.conf
+run_restore() {
+    local source_dir=$1
+    local restore_date=$2
+    local dest=${3:-}
+    local dest_dir tar_rc ssh_rc
+    local -a pipe_status
 
-# Buscar la subcarpeta correspondiente al directorio de origen
-for path in "${backup_paths[@]}"; do
-    IFS=":" read -r config_source_dir remote_backup_subdir <<< "$path"
-    remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
-
-    if [ "$config_source_dir" == "$source_dir" ]; then
-        snar_file="$remote_backup_subdir/$remote_backup_subdir.snar" # Ruta en el servidor remoto
-        local_snar_file="/tmp/$(basename "$snar_file")" # Ruta temporal en el local
-        break
+    if ! resolve_remote_subdir "$source_dir"; then
+        handle_error "no hay backup configurado para $source_dir"
     fi
-done
+    dest_dir="${remote_backup_dir}/${remote_backup_subdir}"
 
-if [ -z "$remote_backup_subdir" ]; then
-    echo "No se encontró una configuración de backup para $source_dir"
-    exit 1
-fi
-
-# Crear el directorio temporal donde se restaurarán los archivos
-if [ -z "$3" ]; then
-    temp_restore_dir="/tmp/restore_$remote_backup_subdir$RANDOM"
-
-else
-    temp_restore_dir="$3"
-fi
-
-mkdir -p "$temp_restore_dir"
-
-# Obtener la lista de archivos de backup en orden cronológico
-backup_files=$(ssh -i "$ssh_key" "$ssh_user@$ssh_server" "ls -1 $remote_backup_dir/$remote_backup_subdir/*.tar.gz" | sort)
-
-# Filtrar los backups hasta la fecha de restauración
-files_to_restore=()
-for file in $backup_files; do
-    backup_filename=$(basename "$file" .tar.gz)
-
-    # Obtener la fecha del backup a partir del nombre del archivo
-    backup_date=$(echo "$backup_filename" | grep -oP '(\d{4}-\d{2}-\d{2}_\d{6})')
-
-    if [ "$backup_date" \< "$restore_date" ] || [ "$backup_date" == "$restore_date" ]; then
-        files_to_restore+=("$file")
+    if [[ -z "$dest" ]]; then
+        dest="/tmp/restore_${remote_backup_subdir}_$$"
     fi
-done
+    mkdir -p "$dest"
+    log_message "Restaurando $source_dir @ $restore_date → $dest"
 
-# Verificar que hay archivos para restaurar
-if [ ${#files_to_restore[@]} -eq 0 ]; then
-    echo "No se encontraron backups para restaurar hasta la fecha $restore_date"
-    exit 1
-fi
-
-# Restaurar los archivos en orden cronológico
-for file in "${files_to_restore[@]}"; do
-    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restaurando desde $file"
-    
-    # Descargar el archivo de backup y restaurar desde él
-    ssh -i "$ssh_key" "$ssh_user@$ssh_server" "cat $file" | tar --extract --gzip --listed-incremental=/dev/null --directory="$temp_restore_dir"
-
-    if [ $? -ne 0 ]; then
-        echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Error al restaurar desde $file"
-        handle_error
+    if ! select_restore_chain "$dest_dir" "$restore_date"; then
+        handle_error "no hay backups hasta la fecha $restore_date"
     fi
-done
 
-# Restaurar el archivo .snar
-if [ -n "$local_snar_file" ]; then
-    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restaurando el archivo .snar desde el servidor remoto"
-    scp -i "$ssh_key" "$ssh_user@$ssh_server:$remote_backup_dir/$remote_backup_subdir/$(basename "$snar_file")" "$local_snar_file" || handle_error
-fi
+    for f in "${files_to_restore[@]}"; do
+        log_message "Aplicando $(basename -- "$f")"
+        set +e
+        ssh_cmd "cat $(printf '%q' "$f")" | tar --extract --gzip --listed-incremental=/dev/null --directory="$dest"
+        pipe_status=("${PIPESTATUS[@]}")
+        ssh_rc=${pipe_status[0]}
+        tar_rc=${pipe_status[1]}
+        set -e
+        if (( tar_rc > 1 || ssh_rc != 0 )); then
+            handle_error "al extraer $f (tar=${tar_rc} ssh=${ssh_rc})"
+        fi
+        if (( tar_rc == 1 )); then
+            log_message "Aviso: tar extract código 1 al aplicar $(basename -- "$f")"
+        fi
+    done
 
-echo "[$(date +%Y-%m-%d\ %H:%M:%S)] Restauración completada en $temp_restore_dir"
+    log_message "Restauración completada en $dest"
+}
+
+case "$1" in
+    --list|--list-dates)
+        [[ -n "${2:-}" ]] || { usage; exit 1; }
+        list_dates "$2"
+        ;;
+    --restore)
+        [[ -n "${2:-}" && -n "${3:-}" ]] || { usage; exit 1; }
+        run_restore "$2" "$3" "${4:-}"
+        ;;
+    --restore-latest)
+        [[ -n "${2:-}" ]] || { usage; exit 1; }
+        if ! resolve_remote_subdir "$2"; then
+            handle_error "no hay backup configurado para $2"
+        fi
+        latest=$(latest_backup_date "${remote_backup_dir}/${remote_backup_subdir}")
+        [[ -n "$latest" ]] || handle_error "no hay archivos de backup remotos"
+        run_restore "$2" "$latest" "${3:-}"
+        ;;
+    *)
+        [[ -n "${2:-}" ]] || { usage; exit 1; }
+        run_restore "$2" "$1" "${3:-}"
+        ;;
+esac

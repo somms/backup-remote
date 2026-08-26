@@ -1,112 +1,233 @@
 #!/bin/bash
+set -euo pipefail
 
-LOG_FILE="/var/log/backup_remote.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=backup-lib.sh
+source "${SCRIPT_DIR}/backup-lib.sh"
 
-# Función para manejar errores
-handle_error() {
-    log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error en el proceso de backup. Abortando."
-    exit 1
-}
+init_log
+load_backup_config
 
-# Función para loguear mensajes
-log_message() {
-    echo "[$(date +%Y-%m-%d\ %H:%M:%S)] $1" | tee -a "$LOG_FILE"
-}
-
-# Leer configuración
-CONFIG_FILE="$HOME/.backup_remote.conf"
-if [ ! -f "$CONFIG_FILE" ]; then
-    CONFIG_FILE="/etc/backup_remote.conf"
+LOCK_FILE="${BACKUP_REMOTE_LOCK:-${HOME}/.backup-remote.lock}"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    handle_error "ya hay un backup en curso (lock $LOCK_FILE)"
 fi
 
-if [ -f "$CONFIG_FILE" ]; then
-    log_message "Cargando configuración desde $CONFIG_FILE"
-    source "$CONFIG_FILE"
-else
-    log_message "No se encontró ningún archivo de configuración."
-    handle_error
-fi
+SLEEP_INHIBIT_PID=""
+start_sleep_inhibit() {
+    local psx=""
+    if command -v powershell.exe >/dev/null 2>&1; then
+        psx=$(command -v powershell.exe)
+    elif [[ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]]; then
+        psx=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+    else
+        log_message "Aviso: no hay powershell.exe; Windows puede suspender el equipo durante el backup"
+        return 0
+    fi
+    "$psx" -NoProfile -Command '
+        Add-Type -Namespace Win32 -Name Native -MemberDefinition @"
+            [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+            public static extern uint SetThreadExecutionState(uint esFlags);
+"@
+        [Win32.Native]::SetThreadExecutionState([uint]0x80000041) | Out-Null
+        while ($true) { Start-Sleep -Seconds 60 }
+    ' >/dev/null 2>&1 &
+    SLEEP_INHIBIT_PID=$!
+    log_message "Inhibiendo suspensión de Windows (pid ${SLEEP_INHIBIT_PID})"
+}
+stop_sleep_inhibit() {
+    if [[ -n "${SLEEP_INHIBIT_PID}" ]] && kill -0 "$SLEEP_INHIBIT_PID" 2>/dev/null; then
+        kill "$SLEEP_INHIBIT_PID" 2>/dev/null || true
+        wait "$SLEEP_INHIBIT_PID" 2>/dev/null || true
+    fi
+    SLEEP_INHIBIT_PID=""
+}
+trap 'stop_sleep_inhibit' EXIT
+start_sleep_inhibit
 
-# Fecha actual para el nombre de los backups
 current_date=$(date +"%Y-%m-%d_%H%M%S")
+now_epoch=$(date +%s)
 
-# Definir si es tiempo de realizar una nueva "copia completa"
-is_full_backup=false
-if [ $(date +%d) -eq 1 ] && [ $(expr $(date +%m) % 3) -eq 0 ]; then
-    is_full_backup=true
-    log_message "Se realizará una copia completa."
-else
-    log_message "Se realizará una copia incremental."
-fi
+newest_full_date() {
+    local dest_dir=$1
+    local f latest=""
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ "$parsed_kind" == "full" ]]; then
+            latest="$parsed_date"
+        fi
+    done < <(list_remote_archives "$dest_dir")
+    printf '%s' "$latest"
+}
 
-# Hacer backup para cada ruta especificada en el archivo de configuración
+should_run_full() {
+    local dest_dir=$1
+    local remote_snar=$2
+
+    if [[ "${BACKUP_FORCE_FULL:-0}" == "1" ]]; then
+        log_message "Full forzado por BACKUP_FORCE_FULL=1"
+        return 0
+    fi
+
+    if ! ssh_cmd "test -e $(printf '%q' "$remote_snar")"; then
+        log_message "No hay snapshot .snar remoto: se hará copia completa"
+        return 0
+    fi
+
+    local last_full
+    last_full=$(newest_full_date "$dest_dir")
+    if [[ -z "$last_full" ]]; then
+        log_message "No hay un full con sufijo -full en el destino: se hará copia completa"
+        return 0
+    fi
+
+    local last_epoch age_days
+    last_epoch=$(backup_date_to_epoch "$last_full")
+    age_days=$(( (now_epoch - last_epoch) / 86400 ))
+    if (( age_days >= full_backup_max_days )); then
+        log_message "Último full ($last_full) tiene ${age_days} días (>= ${full_backup_max_days}): se hará copia completa"
+        return 0
+    fi
+
+    log_message "Último full $last_full hace ${age_days} días: copia incremental"
+    return 1
+}
+
+prune_old_cycles() {
+    local dest_dir=$1
+    local -a files=()
+    local -a fulls=()
+    local f cutoff=""
+
+    mapfile -t files < <(list_remote_archives "$dest_dir")
+    for f in "${files[@]}"; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ "$parsed_kind" == "full" ]]; then
+            fulls+=("$f")
+        fi
+    done
+
+    if (( ${#fulls[@]} <= keep_full_cycles )); then
+        log_message "Retención: ${#fulls[@]} full(s) (límite ${keep_full_cycles}), no se borra nada"
+        return 0
+    fi
+
+    local keep_from=$(( ${#fulls[@]} - keep_full_cycles ))
+    parse_backup_name "${fulls[$keep_from]}"
+    cutoff="$parsed_date"
+    log_message "Retención: se conservan ${keep_full_cycles} ciclos desde el full $cutoff"
+
+    for f in "${files[@]}"; do
+        [[ -z "$f" ]] && continue
+        parse_backup_name "$f"
+        if [[ -z "$parsed_date" ]]; then
+            continue
+        fi
+        if [[ "$parsed_date" < "$cutoff" ]]; then
+            log_message "Retención: borrando $f"
+            ssh_cmd "rm -f $(printf '%q' "${dest_dir}/${f}")"
+        fi
+    done
+}
+
+tar_exclude_args() {
+    local pat
+    for pat in "${backup_excludes[@]}"; do
+        printf -- '--exclude=%s\n' "$pat"
+    done
+    if [[ "$one_file_system" == "true" ]]; then
+        printf -- '%s\n' --one-file-system
+    fi
+}
+
+backup_one_path() {
+    local path=$1
+    local source_dir remote_subdir dest_dir remote_snar local_snar
+    local backup_file remote_archive is_full_backup=false
+    local -a tar_args=()
+    local tar_rc ssh_rc gzip_rc
+    local -a pipe_status
+
+    IFS=":" read -r source_dir remote_subdir <<<"$path"
+    remote_subdir="${remote_subdir%/}"
+    dest_dir="${remote_backup_dir}/${remote_subdir}"
+    remote_snar="${dest_dir}/${remote_subdir}.snar"
+    local_snar="/tmp/${remote_subdir}.snar.$$"
+
+    log_message "Preparando copia de $source_dir → ${ssh_server}:${dest_dir}"
+
+    if [[ ! -d "$source_dir" ]]; then
+        handle_error "no existe el directorio de origen $source_dir"
+    fi
+
+    ssh_cmd "mkdir -p $(printf '%q' "$dest_dir")"
+    rm -f -- "$local_snar"
+
+    if should_run_full "$dest_dir" "$remote_snar"; then
+        is_full_backup=true
+        backup_file="${remote_subdir}-${current_date}-full.tar.gz"
+        log_message "Copia completa → $backup_file"
+    else
+        backup_file="${remote_subdir}-${current_date}-inc.tar.gz"
+        log_message "Copia incremental → $backup_file"
+        log_message "Descargando snapshot $remote_snar"
+        scp_from_remote "$remote_snar" "$local_snar"
+    fi
+
+    remote_archive="${dest_dir}/${backup_file}"
+    mapfile -t tar_args < <(tar_exclude_args)
+    tar_args+=(--create --gzip --file=- --listed-incremental="$local_snar" -- "$source_dir")
+
+    log_message "Creando y enviando backup (sin copia local del archivo)"
+    set +e
+    tar "${tar_args[@]}" | ssh_cmd "cat > $(printf '%q' "$remote_archive")"
+    pipe_status=("${PIPESTATUS[@]}")
+    tar_rc=${pipe_status[0]}
+    ssh_rc=${pipe_status[1]}
+    set -e
+
+    if (( tar_rc > 1 || ssh_rc != 0 )); then
+        log_message "Falló el pipe tar|ssh (tar=${tar_rc} ssh=${ssh_rc}); se elimina el archivo incompleto"
+        ssh_cmd "rm -f $(printf '%q' "$remote_archive")" || true
+        rm -f -- "$local_snar"
+        handle_error "tar/ssh al crear $backup_file"
+    fi
+    if (( tar_rc == 1 )); then
+        log_message "Aviso: tar salió con código 1 (ficheros cambiaron durante la lectura); se considera usable"
+    fi
+
+    log_message "Verificando integridad gzip en remoto"
+    set +e
+    ssh_cmd "gzip -t $(printf '%q' "$remote_archive")"
+    gzip_rc=$?
+    set -e
+    if (( gzip_rc == 0 )); then
+        :
+    elif (( gzip_rc == 1 )); then
+        log_message "gzip -t: archivo corrupto (rc=1); se elimina el tar.gz"
+        ssh_cmd "rm -f $(printf '%q' "$remote_archive")" || true
+        rm -f -- "$local_snar"
+        handle_error "gzip -t: $backup_file corrupto; no se actualiza el .snar"
+    else
+        rm -f -- "$local_snar"
+        handle_error "no se pudo verificar $backup_file (ssh rc=${gzip_rc}: corte de red o suspensión). El tar.gz se deja en el servidor; no se actualiza el .snar. En caudatus: gzip -t ${remote_archive}"
+    fi
+
+    log_message "Subiendo snapshot .snar"
+    scp_to_remote "$local_snar" "${remote_snar}"
+    rm -f -- "$local_snar"
+
+    log_message "Backup verificado: $backup_file"
+    if [[ "$is_full_backup" == true ]]; then
+        prune_old_cycles "$dest_dir"
+    fi
+}
+
+log_message "Inicio de backup (log $LOG_FILE)"
 for path in "${backup_paths[@]}"; do
-    IFS=":" read -r source_dir remote_backup_subdir <<< "$path"
-    remote_backup_subdir="${remote_backup_subdir%/}" # Eliminar barra final si existe
-    snar_file="$remote_backup_subdir/$remote_backup_subdir.snar" # Ruta en el servidor remoto
-    local_snar_file="/tmp/$(basename "$snar_file")" # Ruta temporal en el local
-
-    log_message "Preparando copia del directorio $path a $remote_backup_subdir en el servidor $ssh_server."
-
-    # Verificar y crear el directorio remoto si no existe
-    log_message "Verificando el directorio remoto $remote_backup_dir/$remote_backup_subdir/"
-    ssh -i "$ssh_key" "$ssh_user@$ssh_server" "mkdir -p \"$remote_backup_dir/$remote_backup_subdir\"" || handle_error
-    
-    log_message "Directorio remoto verificado/creado correctamente."
-	
-	# Eliminamos el archivoi .snar anterior en local si existiera de una operación anterior
-	rm $local_snar_file
-
-    if [ "$is_full_backup" = true ]; then
-        # Nueva "copia completa" (sin referencia previa)
-        log_message "Realizando nueva copia completa."
-
-        ## Eliminar el archivo .snar anterior en el servidor remoto si existe
-        #ssh -i "$ssh_key" "$ssh_user@$ssh_server" "rm -f \"$remote_backup_dir/$snar_file\"" || handle_error
-
-        # Nombre del archivo de backup
-        backup_file="${remote_backup_subdir}-${current_date}.tar.gz"
-
-        # Eliminar el archivo .snar local si existe
-        rm -f "$local_snar_file"
-    else
-        # Backup incremental
-        log_message "Realizando copia incremental."
-        log_message "Comprobando existencia de snapshot previo en el servidor remoto para $source_dir"
-        if ssh -i "$ssh_key" "$ssh_user@$ssh_server" test -e "$remote_backup_dir/$snar_file"; then
-            log_message "Descargando snapshot previo para $source_dir."
-            scp -i "$ssh_key" "$ssh_user@$ssh_server:$remote_backup_dir/$snar_file" "$local_snar_file" || handle_error
-        fi
-                
-        # Nombre del archivo de backup incremental
-        backup_file="${remote_backup_subdir}-${current_date}.tar.gz"
-    fi
-
-    log_message "Creando backup"
-    # Crear el backup y manejar el archivo .snar en el servidor remoto
-    tar --create --gzip --file=- --listed-incremental="$local_snar_file" "$source_dir" | ssh -i "$ssh_key" "$ssh_user@$ssh_server" "cat > \"$remote_backup_dir/$remote_backup_subdir/$backup_file\""
-
-    log_message "Actualizando fichero de seguimiento .snar"
-    # Subir el archivo .snar actualizado al servidor remoto
-    scp -i "$ssh_key" "$local_snar_file" "$ssh_user@$ssh_server:$remote_backup_dir/$remote_backup_subdir/" || handle_error
-
-    # Comprobar si el backup se realizó correctamente
-    if [ $? -eq 0 ]; then
-        log_message "Backup realizado con éxito: $backup_file"
-        if [ "$is_full_backup" = true ]; then
-            # Eliminar copias anteriores del directorio remoto
-            log_message "Eliminando copias completas e incrementales anteriores."
-            ssh -i "$ssh_key" "$ssh_user@$ssh_server" "
-                find \"$remote_backup_dir/$remote_backup_subdir/\" -type f -name '*.tar.gz' ! -name '$backup_file' -delete
-            " || handle_error
-        fi
-    else
-        log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Error al realizar el backup."
-        handle_error
-    fi
-	
-	#Borrando ficheros temporales
-
+    backup_one_path "$path"
 done
-
-log_message "[$(date +%Y-%m-%d\ %H:%M:%S)] Todos los backups se han realizado con éxito."
+log_message "Todos los backups se han realizado con éxito."
