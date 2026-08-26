@@ -11,12 +11,25 @@ Uso:
   $0 --list|--list-dates <directorio-origen>
   $0 --restore <directorio-origen> <fecha> [directorio-destino]
   $0 --restore-latest <directorio-origen> [directorio-destino]
-  $0 <fecha> <directorio-origen> [directorio-destino]
+  $0 [--resume] <fecha> <directorio-origen> [directorio-destino]
+  $0 --resume --restore <directorio-origen> <fecha> [directorio-destino]
 
 Fecha: YYYY-MM-DD_HHMMSS
 Si no se indica destino, se restaura en /tmp/restore_<subdir>_<pid>
+--resume continúa tras el último archivo guardado en /tmp/restore_checkpoint_<subdir>.txt
 EOF
 }
+
+resume_mode=false
+cli_args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--resume" ]]; then
+        resume_mode=true
+    else
+        cli_args+=("$arg")
+    fi
+done
+set -- "${cli_args[@]+"${cli_args[@]}"}"
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     usage
@@ -115,8 +128,10 @@ run_restore() {
     local source_dir=$1
     local restore_date=$2
     local dest=${3:-}
-    local dest_dir tar_rc ssh_rc
+    local dest_dir tar_rc ssh_rc pv_rc
     local -a pipe_status
+    local checkpoint_file last_restored="" backup_filename file_size
+    local use_pv=false
 
     if ! resolve_remote_subdir "$source_dir"; then
         handle_error "no hay backup configurado para $source_dir"
@@ -129,17 +144,58 @@ run_restore() {
     mkdir -p "$dest"
     log_message "Restaurando $source_dir @ $restore_date → $dest"
 
+    checkpoint_file="/tmp/restore_checkpoint_${remote_backup_subdir}.txt"
+    if [[ "$resume_mode" == true ]]; then
+        if [[ -f "$checkpoint_file" ]]; then
+            last_restored=$(<"$checkpoint_file")
+            log_message "Modo reanudar activado: continuando después de $last_restored"
+        else
+            log_message "No existe checkpoint previo, se restaurará desde el inicio."
+        fi
+    fi
+
     if ! select_restore_chain "$dest_dir" "$restore_date"; then
         handle_error "no hay backups hasta la fecha $restore_date"
     fi
 
+    if command -v pv >/dev/null 2>&1; then
+        use_pv=true
+    fi
+
     for f in "${files_to_restore[@]}"; do
-        log_message "Aplicando $(basename -- "$f")"
+        backup_filename=$(basename -- "$f" .tar.gz)
+
+        if [[ "$resume_mode" == true && -n "$last_restored" && ( "$backup_filename" < "$last_restored" || "$backup_filename" == "$last_restored" ) ]]; then
+            log_message "Saltando $backup_filename (ya restaurado)"
+            continue
+        fi
+
+        file_size=$(ssh_cmd "stat -c %s $(printf '%q' "$f")" 2>/dev/null || true)
+        file_size=${file_size:-0}
+        if [[ "$file_size" =~ ^[0-9]+$ && "$file_size" -gt 0 ]]; then
+            log_message "Aplicando $(basename -- "$f") (tamaño: $((file_size / 1024 / 1024)) MB)"
+        else
+            log_message "Aplicando $(basename -- "$f")"
+            file_size=0
+        fi
+
         set +e
-        ssh_cmd "cat $(printf '%q' "$f")" | tar --extract --gzip --listed-incremental=/dev/null --directory="$dest"
-        pipe_status=("${PIPESTATUS[@]}")
-        ssh_rc=${pipe_status[0]}
-        tar_rc=${pipe_status[1]}
+        if [[ "$use_pv" == true && "$file_size" -gt 0 ]]; then
+            ssh_cmd "cat $(printf '%q' "$f")" | pv -s "$file_size" | tar --extract --gzip --listed-incremental=/dev/null --directory="$dest"
+            pipe_status=("${PIPESTATUS[@]}")
+            ssh_rc=${pipe_status[0]}
+            pv_rc=${pipe_status[1]}
+            tar_rc=${pipe_status[2]}
+            if (( pv_rc != 0 )); then
+                set -e
+                handle_error "al transferir $f (pv=${pv_rc})"
+            fi
+        else
+            ssh_cmd "cat $(printf '%q' "$f")" | tar --extract --gzip --listed-incremental=/dev/null --directory="$dest"
+            pipe_status=("${PIPESTATUS[@]}")
+            ssh_rc=${pipe_status[0]}
+            tar_rc=${pipe_status[1]}
+        fi
         set -e
         if (( tar_rc > 1 || ssh_rc != 0 )); then
             handle_error "al extraer $f (tar=${tar_rc} ssh=${ssh_rc})"
@@ -147,8 +203,11 @@ run_restore() {
         if (( tar_rc == 1 )); then
             log_message "Aviso: tar extract código 1 al aplicar $(basename -- "$f")"
         fi
+
+        echo "$backup_filename" >"$checkpoint_file"
     done
 
+    rm -f "$checkpoint_file"
     log_message "Restauración completada en $dest"
 }
 
